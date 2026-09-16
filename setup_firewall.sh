@@ -163,6 +163,70 @@ run_chk() {
 # 探测型命令：只取真假，不输出错误
 quiet() { "$@" >/dev/null 2>&1; }
 
+# ------------------------------------------------------------
+# 规则文件行的统一判据
+#
+# dsl_list / dsl_delete / count_rules 必须用**完全一致**的"哪些行算规则"的判据,
+# 否则列表里看到的编号和"输入编号删除"实际删的那条会对不上 —— 手工往
+# rules.dsl 里加过缩进注释时会真的删错规则。
+# ------------------------------------------------------------
+_dsl_skip() {
+    # 空行 / 纯空白 / 注释 (允许前导缩进) -> 应跳过
+    local t="$1"
+    t="${t#"${t%%[![:space:]]*}"}"
+    case "${t}" in
+        ''|\#*) return 0 ;;
+    esac
+    return 1
+}
+
+# IPv4 字面量 -> 32 位无符号整数 (失败返回非 0, 不输出)
+_ip4_to_u32() {
+    local a b c d p
+    IFS=. read -r a b c d <<< "$1"
+    for p in "$a" "$b" "$c" "$d"; do
+        case "${p}" in ''|*[!0-9]*) return 1 ;; esac
+        [ "${p}" -le 255 ] || return 1
+    done
+    printf '%s' "$(( (a << 24) | (b << 16) | (c << 8) | d ))"
+}
+
+# 判断 IPv4 是否落在 CIDR 内 (仅 IPv4; 不依赖 ipcalc/python)
+ip_in_cidr() {
+    local ip="$1" cidr="$2" net prefix ipn netn mask
+    case "${ip}" in ''|*[!0-9.]*) return 1 ;; esac
+    case "${cidr}" in
+        */*) net="${cidr%%/*}"; prefix="${cidr##*/}" ;;
+        *)   net="${cidr}";     prefix=32 ;;
+    esac
+    case "${prefix}" in ''|*[!0-9]*) return 1 ;; esac
+    { [ "${prefix}" -ge 0 ] && [ "${prefix}" -le 32 ]; } || return 1
+    ipn="$(_ip4_to_u32 "${ip}")"   || return 1
+    netn="$(_ip4_to_u32 "${net}")" || return 1
+    if [ "${prefix}" -eq 0 ]; then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    [ $(( ipn & mask )) -eq $(( netn & mask )) ]
+}
+
+# 读取菜单选项。
+#
+# 必须显式处理 EOF: stdin 被重定向到 /dev/null 或管道结束时, `read` 每次都失败
+# 并留下空值, `while true` 菜单会**一直空转** —— 表现为脚本卡住但没有任何输出,
+# 而且 Ctrl-C 之前完全看不出发生了什么。
+#   read_menu_choice <变量名> <提示语>
+read_menu_choice() {
+    local __name="$1" __prompt="$2"
+    if ! read -r -p "${__prompt}" "${__name}"; then
+        printf '\n'
+        log_warn "标准输入已结束 (EOF)，脚本退出"
+        save_env 2>/dev/null || true
+        exit 0
+    fi
+}
+
 # ============================================================================
 #  第 3 节：防火墙方案探测
 #
@@ -402,7 +466,10 @@ dsl_add() {
         log_err "规则包含非法字符，已拒绝: ${line}"
         return 1
     fi
-    if [ -n "${line##*[!$' \t\n']*}" ] 2>/dev/null; then
+    # 判空用"去掉所有空白后是否为空" —— 原来的 ${line##*[!$' \t\n']*} 写法
+    # 只拦得住纯空白, 拦不住真正的空串 (空串匹配不上该模式, 结果仍是空串,
+    # 于是 -n 为假 -> 不报错 -> 被当成一条空规则写进文件)
+    if [ -z "${line//[[:space:]]/}" ]; then
         log_err "规则为空，已拒绝"
         return 1
     fi
@@ -429,8 +496,8 @@ dsl_list() {
     hr
     local found=0
     while IFS= read -r line || [ -n "${line}" ]; do
-        [ -z "${line}" ] && continue
-        case "${line}" in \#*) continue ;; esac
+        # 判据必须与 dsl_delete / count_rules 一致 (含缩进的注释也算注释)
+        _dsl_skip "${line}" && continue
         # shellcheck disable=SC2086
         set -- ${line}
         printf '  %-4s %-9s %-6s %-6s %-16s %-16s %s\n' \
@@ -455,7 +522,11 @@ dsl_delete() {
     read -r -p "确认删除? [y/N]: " ans
     [ "${ans:-N}" = "y" ] || return
     local tmp; tmp="$(mktemp)"
-    grep -vxF -- "${line}" "${F_RULES}" > "${tmp}" && mv "${tmp}" "${F_RULES}"
+    # 注意: grep 在"没有一行被保留"时返回 1。写成 `grep ... > tmp && mv` 时，
+    # 一旦 rules.dsl 里只剩这一条规则（没有注释/空行兜底），mv 就不会执行 ——
+    # 表现为"提示已删除，实际没删"。所以显式吞掉返回码再 mv。
+    grep -vxF -- "${line}" "${F_RULES}" > "${tmp}" || true
+    mv "${tmp}" "${F_RULES}"
     log_info "已删除（需重新应用后生效）"
     rm -f "${tmp}" 2>/dev/null
 }
@@ -630,13 +701,15 @@ _ipt_load_user() {
 be_iptables_persist() { persist_iptables; }
 
 be_iptables_status() {
+    # 注意: `iptables -S <链>` 输出形如 "-P INPUT DROP"，字段是
+    # $1=-P  $2=链名  $3=策略 —— 判据写成 $2=="-P" 会永远匹配不上, 策略列恒为空
     for chain in INPUT FORWARD OUTPUT; do
-        printf '  %-8s : %s\n' "${chain}" "$(iptables -S "${chain}" 2>/dev/null | awk '$2=="-P"{print $3}')"
+        printf '  %-8s : %s\n' "${chain}" "$(iptables -S "${chain}" 2>/dev/null | awk '$1=="-P"{print $3}')"
     done
     [ "${HAS_V6}" -eq 1 ] && {
         printf '  -- IPv6 --\n'
         for chain in INPUT FORWARD OUTPUT; do
-            printf '  %-8s : %s\n' "${chain}" "$(ip6tables -S "${chain}" 2>/dev/null | awk '$2=="-P"{print $3}')"
+            printf '  %-8s : %s\n' "${chain}" "$(ip6tables -S "${chain}" 2>/dev/null | awk '$1=="-P"{print $3}')"
         done
     }
     printf '\n'
@@ -817,8 +890,14 @@ be_nftables_persist() {
 }
 
 be_nftables_status() {
-    nft list table "${NFT_FAMILY}" "${NFT_TABLE}" 2>/dev/null | sed 's/^/  /' ||
+    # 注意: 不能写成 `nft ... | sed ... || printf '(尚未创建...)'` —— 管道的
+    # 退出码取自 sed, 而 sed 对空输入也返回 0, 于是那个兜底分支永远不会执行
+    local out
+    if out="$(nft list table "${NFT_FAMILY}" "${NFT_TABLE}" 2>/dev/null)" && [ -n "${out}" ]; then
+        printf '%s\n' "${out}" | sed 's/^/  /'
+    else
         printf '  (尚未创建 %s %s 表)\n' "${NFT_FAMILY}" "${NFT_TABLE}"
+    fi
 }
 
 be_nftables_reset() {
@@ -1264,20 +1343,29 @@ EOF
 # ============================================================================
 snapshot_current() {
     # 生成当前运行时规则的"还原脚本"，跨后端可用
+    #   iptables 后端会额外写 <f>.v6 —— IPv4/IPv6 必须分开存, 因为
+    #   ip6tables-restore 读不了 iptables-save 的文本 (会直接语法报错)
     local f="$1"
     : > "${f}"
     case "${FW_BACKEND}" in
-        iptables|nftables)
-            command -v iptables-save >/dev/null 2>&1 && iptables-save >> "${f}" 2>/dev/null
-            ;;
         nftables)
-            command -v nft >/dev/null 2>&1 && nft list ruleset >> "${f}" 2>/dev/null
+            # 注意: nftables 必须排在 iptables 之前判断 —— 写成
+            # `iptables|nftables)` 会把 nft 后端也吃进去, 结果给 nft 存了一份
+            # iptables-save 文本, 回滚时 `nft -f` 必然失败 (且静默)
+            command -v nft >/dev/null 2>&1 && nft list ruleset >> "${f}" 2>/dev/null || true
+            ;;
+        iptables)
+            command -v iptables-save >/dev/null 2>&1 && iptables-save >> "${f}" 2>/dev/null || true
+            if [ "${NEED_V6}" -eq 1 ] && [ "${HAS_V6}" -eq 1 ]; then
+                command -v ip6tables-save >/dev/null 2>&1 &&
+                    ip6tables-save >> "${f}.v6" 2>/dev/null || true
+            fi
             ;;
         firewalld)
-            firewall-cmd --list-all-zones >> "${f}" 2>/dev/null
+            firewall-cmd --list-all-zones >> "${f}" 2>/dev/null || true
             ;;
         ufw)
-            ufw status verbose >> "${f}" 2>/dev/null
+            ufw status verbose >> "${f}" 2>/dev/null || true
             ;;
     esac
 }
@@ -1299,7 +1387,13 @@ restore_snapshot() {
     case "${FW_BACKEND}" in
         iptables)
             iptables-restore < "${f}" && log_info "IPv4 规则已还原"
-            [ "${HAS_V6}" -eq 1 ] && ip6tables-restore < "${f}" 2>/dev/null
+            if [ "${NEED_V6}" -eq 1 ] && [ "${HAS_V6}" -eq 1 ]; then
+                if [ -s "${f}.v6" ]; then
+                    ip6tables-restore < "${f}.v6" && log_info "IPv6 规则已还原"
+                else
+                    log_warn "未找到 IPv6 快照 (${f}.v6)，已跳过 IPv6 还原"
+                fi
+            fi
             ;;
         nftables)
             nft -f "${f}" && log_info "nftables 规则集已还原"
@@ -1342,23 +1436,45 @@ rollback_menu() {
 #  第 8 节：应用（含防锁死保护）
 # ============================================================================
 ensure_ssh_allowed() {
-    local p="${SSH_PORT}" found=0
+    local p="${SSH_PORT}" port_ok=0 src_ok=0 src line
     while IFS= read -r line || [ -n "${line}" ]; do
-        [ -z "${line}" ] && continue
-        case "${line}" in \#*) continue ;; esac
+        _dsl_skip "${line}" && continue
         # shellcheck disable=SC2086
         set -- ${line}
-        # 入站 accept 且端口列命中 SSH 端口
-        if [ "${1:-}" = "in" ] && [ "${2:-}" = "accept" ] && [ "${4:--}" != "-" ]; then
-            printf '%s' "${4}" | tr ',' '\n' | grep -qx -- "${p}" && found=1
-        fi
-        # 整段来源放行也视为放行
-        if [ "${1:-}" = "in" ] && [ "${2:-}" = "accept" ] && [ "${5:--}" != "-" ]; then found=1; fi
-    done < "${F_RULES}"
-    [ "${found}" -eq 1 ] && return 0
+        [ "${1:-}" = "in" ] && [ "${2:-}" = "accept" ] || continue
 
-    printf "${C_Y}检测到入站将设为严格模式，但规则列表中没有放行 SSH 端口 %s${C_N}\n" "${p}"
-    read -r -p "是否立即放行 SSH ${p}/tcp ? [Y/n]: " ans
+        # 端口列命中 SSH 端口 (端口为 "-" 表示不限端口)
+        if [ "${4:--}" != "-" ]; then
+            printf '%s' "${4}" | tr ',' '\n' | grep -qx -- "${p}" || continue
+        fi
+
+        src="${5:--}"
+        if [ "${src}" = "-" ]; then
+            port_ok=1; src_ok=1
+            continue
+        fi
+        # 限了来源: 只有能证明"当前这条 SSH 连接就在该来源范围内"才算放行。
+        # 原来的实现把任意带来源的 accept 直接当成已放行 —— 如果规则是
+        # `in accept any - 10.0.0.0/8 -` 而你在 192.168.1.x, 应用后就会把自己
+        # 关在门外, 而脚本不会拦你。
+        port_ok=1
+        if [ -n "${SSH_CLIENT_IP:-}" ] && ip_in_cidr "${SSH_CLIENT_IP}" "${src}"; then
+            src_ok=1
+        fi
+    done < "${F_RULES}"
+    [ "${port_ok}" -eq 1 ] && [ "${src_ok}" -eq 1 ] && return 0
+
+    if [ "${port_ok}" -eq 1 ]; then
+        printf "${C_Y}规则里放行了 SSH 端口 %s，但来源范围不包含当前连接来源。${C_N}\n" "${p}"
+        if [ -n "${SSH_CLIENT_IP:-}" ]; then
+            printf "${C_Y}  当前连接来源: %s —— 不在上面任何一条放行规则的来源范围内${C_N}\n" "${SSH_CLIENT_IP}"
+        else
+            printf "${C_Y}  当前不是通过 SSH 进来的（或读不到 SSH_CONNECTION），无法判断你在不在范围内${C_N}\n"
+        fi
+    else
+        printf "${C_Y}检测到入站将设为严格模式，但规则列表中没有放行 SSH 端口 %s${C_N}\n" "${p}"
+    fi
+    read -r -p "是否立即放行 SSH ${p}/tcp（任意来源）? [Y/n]: " ans
     [ "${ans:-Y}" = "n" ] && return 1
     dsl_add "in accept tcp ${p} - -"
     return 0
@@ -1474,7 +1590,7 @@ inbound_menu() {
         printf '  7) 删除规则\n'
         printf '  0) 返回主菜单\n'
         hr
-        read -r -p "请选择: " c
+        read_menu_choice c "请选择: "
         case "${c}" in
             1) ask_port_rule tcp ;;
             2) ask_port_rule udp ;;
@@ -1514,7 +1630,7 @@ outbound_menu() {
         printf '  5) 切换出站默认策略 (ACCEPT <-> DROP)\n'
         printf '  0) 返回主菜单\n'
         hr
-        read -r -p "请选择: " c
+        read_menu_choice c "请选择: "
         case "${c}" in
             1) out_add_rule accept ;;
             2) out_add_rule drop ;;
@@ -1572,7 +1688,7 @@ policy_menu() {
             firewalld) log_warn "firewalld 后端下 FORWARD 由 firewalld 自身管理，建议不要在此修改" ;;
             ufw)       log_warn "ufw 后端下 FORWARD 由 ufw 管理，建议不要在此修改" ;;
         esac
-        read -r -p "请选择: " c
+        read_menu_choice c "请选择: "
         case "${c}" in
             1) set_policy IN_POLICY  "$([ "${IN_POLICY:-DROP}" = "DROP" ] && echo ACCEPT || echo DROP)" ;;
             2) set_policy OUT_POLICY "$([ "${OUT_POLICY:-ACCEPT}" = "DROP" ] && echo ACCEPT || echo DROP)" ;;
@@ -1613,7 +1729,7 @@ sshguard_menu() {
         hr
         printf '  1) 启用 / 禁用\n  2) 设置 SSH 端口\n  3) 设置时间窗（秒）\n  4) 设置触发次数\n  0) 返回主菜单\n'
         hr
-        read -r -p "请选择: " c
+        read_menu_choice c "请选择: "
         case "${c}" in
             1) set_sshguard ENABLED "$([ "${ENABLED:-0}" -eq 1 ] && echo 0 || echo 1)" ;;
             2) read -r -p "SSH 端口: " v; set_sshguard PORT "${v}" ;;
@@ -1697,7 +1813,7 @@ main_menu() {
         printf ' 10) 重置为全放行\n'
         printf '  0) 退出\n'
         hr
-        read -r -p "请选择: " c
+        read_menu_choice c "请选择: "
         case "${c}" in
             1) show_status ;;
             2) inbound_menu ;;
